@@ -16,10 +16,25 @@ Or if you have `Go` installed: `go get -u github.com/pyed/transmission-telegram`
 
 [Wiki](https://github.com/pyed/transmission-telegram/wiki)
 
+### Proxy Support
 
-##  Docker Alternate Installation Route
+To route Telegram API traffic through a SOCKS5 proxy, use the `-proxy` flag or `TT_PROXY` environment variable:
 
-### Standalone
+```bash
+# Via flag
+transmission-telegram -token=xxx -master=@you -proxy=socks5://user:pass@host:port
+
+# Via environment variable
+TT_PROXY=socks5://user:pass@192.168.1.1:1080 transmission-telegram -token=xxx -master=@you
+```
+
+Proxy format: `socks5://[user:pass@]host:port`
+
+Use `socks5h://` to resolve DNS through the proxy (recommended for restricted networks).
+
+### Docker
+
+#### Standalone
 
 ```
 docker run -d --name transmission-telegram \
@@ -31,7 +46,7 @@ kevinhalpin/transmission-telegram:latest \
 -password=<Transmissions If Needed>
 ```
 
-### docker-compose Example
+#### docker-compose Example
 
 ```
 version: '2.4'
@@ -58,4 +73,6 @@ telegram-transmission-bot:
     network_mode: 'host'
     image: kevinhalpin/transmission-telegram:latest
     command: '-token=${TELEGRAM_TRANSMISSION_BOT} -master=${TELEGRAM_USERNAME} -url=${TRANSMISSION_URL} -username=${TRANSMISSION_USERNAME} -password=${PASS}'
+    environment:
+      - TT_PROXY=${PROXY_URL}
 ```

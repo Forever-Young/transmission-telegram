@@ -5,6 +5,8 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net/http"
+	"net/url"
 	"os"
 	"regexp"
 	"strconv"
@@ -123,6 +125,7 @@ var (
 	LogFile      string
 	TransLogFile string // Transmission log file
 	NoLive       bool
+	ProxyURL     string
 
 	// transmission
 	Client *transmission.TransmissionClient
@@ -187,14 +190,20 @@ func init() {
 	flag.StringVar(&LogFile, "logfile", "", "Send logs to a file")
 	flag.StringVar(&TransLogFile, "transmission-logfile", "", "Open transmission logfile to monitor torrents completion")
 	flag.BoolVar(&NoLive, "no-live", false, "Don't edit and update info after sending")
+	flag.StringVar(&ProxyURL, "proxy", "", "SOCKS5 proxy URL (e.g., socks5://user:pass@host:port). Can be passed via TT_PROXY env var")
 
 	// set the usage message
 	flag.Usage = func() {
-		fmt.Fprint(os.Stderr, "Usage: transmission-telegram <-token=TOKEN> <-master=@tuser> [-master=@yuser2] [-url=http://] [-username=user] [-password=pass]\n\n")
+		fmt.Fprint(os.Stderr, "Usage: transmission-telegram <-token=TOKEN> <-master=@tuser> [-master=@yuser2] [-url=http://] [-username=user] [-password=pass] [-proxy=socks5://...]\n\n")
 		flag.PrintDefaults()
 	}
 
 	flag.Parse()
+
+	// check environment variables for optional settings
+	if ProxyURL == "" {
+		ProxyURL = os.Getenv("TT_PROXY")
+	}
 
 	// if we don't have BotToken passed, check the environment variable "TT_BOTT"
 	if BotToken == "" {
@@ -266,8 +275,8 @@ func init() {
 	}
 
 	// log the flags
-	logger.Printf("[INFO] Token=%s\n\t\tMasters=%s\n\t\tURL=%s\n\t\tUSER=%s\n\t\tPASS=%s",
-		BotToken, Masters, RPCURL, Username, Password)
+	logger.Printf("[INFO] Token=%s\n\t\tMasters=%s\n\t\tURL=%s\n\t\tUSER=%s\n\t\tPASS=%s\n\t\tPROXY=%s",
+		BotToken, Masters, RPCURL, Username, Password, ProxyURL)
 }
 
 // init transmission
@@ -285,11 +294,30 @@ func init() {
 func init() {
 	// authorize using the token
 	var err error
-	Bot, err = tgbotapi.NewBotAPI(BotToken)
+	botClient := &http.Client{Timeout: 30 * time.Second}
+	if ProxyURL != "" {
+		proxyURL, err := url.Parse(ProxyURL)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[ERROR] Proxy: failed to parse proxy URL: %s\n", err)
+			os.Exit(1)
+		}
+
+		transport := &http.Transport{
+			Proxy: http.ProxyURL(proxyURL),
+		}
+		botClient = &http.Client{
+			Transport: transport,
+			Timeout:   30 * time.Second,
+		}
+		logger.Printf("[INFO] Telegram proxy configured: %s", ProxyURL)
+	}
+
+	Bot, err = tgbotapi.NewBotAPIWithClient(BotToken, botClient)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[ERROR] Telegram: %s\n", err)
 		os.Exit(1)
 	}
+
 	logger.Printf("[INFO] Authorized: %s", Bot.Self.UserName)
 
 	u := tgbotapi.NewUpdate(0)
