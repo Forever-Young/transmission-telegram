@@ -1,0 +1,144 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+
+      - name: Prepare version commit and release notes
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          REF_NAME: ${{ github.ref_name }}
+          REPOSITORY: ${{ github.repository }}
+          SERVER_URL: ${{ github.server_url }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$REF_NAME" =~ ^v[0-9]+\.[0-9]+$ ]]; then
+            echo "Tag $REF_NAME does not match vX.X, skipping release workflow."
+            exit 0
+          fi
+
+          VERSION_NUMBER="${REF_NAME#v}"
+          VERSION_COMMIT_MESSAGE="Version ${VERSION_NUMBER}"
+
+          git fetch origin "${DEFAULT_BRANCH}"
+          git checkout "${DEFAULT_BRANCH}"
+
+          if [ "$(git rev-parse HEAD)" != "${GITHUB_SHA}" ]; then
+            echo "Tag ${REF_NAME} must point to the tip of ${DEFAULT_BRANCH} for automated versioning."
+            echo "default branch head: $(git rev-parse HEAD)"
+            echo "tag target:          ${GITHUB_SHA}"
+            exit 1
+          fi
+
+          sed -E -i "s/VERSION = \"[^\"]+\"/VERSION = \"${REF_NAME}\"/" main.go
+
+          if git diff --quiet -- main.go; then
+            echo "main.go already contains ${REF_NAME}"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add main.go
+            git commit -m "${VERSION_COMMIT_MESSAGE}"
+            git push origin "HEAD:${DEFAULT_BRANCH}"
+          fi
+
+          git tag -f "${REF_NAME}"
+          git push --force origin "refs/tags/${REF_NAME}"
+
+          mapfile -t version_commits < <(git log --grep='^Version [0-9]\+\.[0-9]\+$' --format='%H' -n 2 HEAD)
+          current_version_commit="${version_commits[0]}"
+          previous_version_commit="${version_commits[1]:-}"
+
+          {
+            echo "## Changes"
+            echo
+
+            if [ -n "${previous_version_commit}" ]; then
+              range="${previous_version_commit}..${current_version_commit}"
+            else
+              range="${current_version_commit}"
+            fi
+
+            found_commits=0
+            while IFS=$'\t' read -r sha subject; do
+              [ -n "${sha}" ] || continue
+              found_commits=1
+              short_sha="$(git rev-parse --short "${sha}")"
+              echo "- ${subject} ([${short_sha}](${SERVER_URL}/${REPOSITORY}/commit/${sha}))"
+            done < <(git log --reverse --format='%H%x09%s' ${range} --invert-grep --grep='^Version [0-9]\+\.[0-9]\+$')
+
+            if [ "${found_commits}" -eq 0 ]; then
+              echo "- No user-facing commits found for this release."
+            fi
+          } > RELEASE_NOTES.md
+
+      - name: Get dependencies
+        run: go mod download
+
+      - name: Build
+        env:
+          CGO_ENABLED: 0
+        run: |
+          set -e
+          mkdir -p dist
+
+          targets=(
+            "darwin_amd64"
+            "darwin_arm64"
+            "linux_386"
+            "linux_amd64"
+            "linux_arm"
+            "linux_arm64"
+            "windows_386"
+            "windows_amd64"
+          )
+
+          for target in "${targets[@]}"; do
+            os="${target%%_*}"
+            arch="${target#*_}"
+            output="transmission-telegram_${os^}_${arch}"
+            [ "$os" = "windows" ] && output="${output}.exe"
+
+            echo "Building ${output}..."
+            GOOS=$os GOARCH=$arch go build -ldflags="-s -w" -o "dist/${output}" .
+            tar -czvf "dist/transmission-telegram_${os^}_${arch}.tar.gz" -C dist "${output}"
+            rm -f "dist/${output}"
+            [ "$os" = "windows" ] && rm -f "dist/${output}.exe" 2>/dev/null || true
+          done
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: dist/*.tar.gz
+          body_path: RELEASE_NOTES.md
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Notify
+        env:
+          NTFY_SH_SUB: ${{ secrets.NTFY_SH_SUB }}
+          REF_NAME: ${{ github.ref_name }}
+        if: env.NTFY_SH_SUB != ''
+        run: |
+          curl -s -X POST "$NTFY_SH_SUB" -H "Title: Release $REF_NAME" -d "Release $REF_NAME built and uploaded"
