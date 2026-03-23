@@ -95,6 +95,26 @@ const (
 	Set file priority (high|normal|low) for one torrent's files.
 	Example: *fprio 12 high 1,2,5-8*
 
+	*startnow* or *sn*
+	Start torrents immediately, bypassing queue position.
+	Example: *startnow 12 19*
+
+	*qtop*
+	Move torrents to top of queue.
+	Example: *qtop 12 19*
+
+	*qup*
+	Move torrents one step up in queue.
+	Example: *qup 12*
+
+	*qdown*
+	Move torrents one step down in queue.
+	Example: *qdown 12*
+
+	*qbottom* or *qbot*
+	Move torrents to bottom of queue.
+	Example: *qbottom 12 19*
+
 	*stop* or *sp*
 	Takes one or more torrent's IDs to stop them, or _all_ to stop all torrents.
 
@@ -748,6 +768,21 @@ func main() {
 		case "fprio", "/fprio", "fp", "/fp":
 			go fprio(update, tokens[1:])
 
+		case "startnow", "/startnow", "sn", "/sn":
+			go queueAction(update, "startnow", "torrent_start_now", tokens[1:])
+
+		case "qtop", "/qtop":
+			go queueAction(update, "qtop", "queue_move_top", tokens[1:])
+
+		case "qup", "/qup":
+			go queueAction(update, "qup", "queue_move_up", tokens[1:])
+
+		case "qdown", "/qdown":
+			go queueAction(update, "qdown", "queue_move_down", tokens[1:])
+
+		case "qbottom", "/qbottom", "qbot", "/qbot":
+			go queueAction(update, "qbottom", "queue_move_bottom", tokens[1:])
+
 		case "stop", "/stop", "sp", "/sp":
 			go stop(update, tokens[1:])
 
@@ -963,6 +998,21 @@ func priorityName(p int) string {
 	default:
 		return fmt.Sprintf("unknown(%d)", p)
 	}
+}
+
+func parseTorrentIDs(tokens []string) ([]int, error) {
+	if len(tokens) == 0 {
+		return nil, fmt.Errorf("missing torrent id(s)")
+	}
+	ids := make([]int, 0, len(tokens))
+	for _, tok := range tokens {
+		id, err := parseIntToken(tok)
+		if err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, nil
 }
 
 // list will form and send a list of all the torrents
@@ -1892,6 +1942,40 @@ func fprio(ud tgbotapi.Update, tokens []string) {
 		return
 	}
 	send(fmt.Sprintf("*fprio:* set %s priority for %d file(s) in `%s`", level, len(fileIDs), mdReplacer.Replace(t.Name)), ud.Message.Chat.ID, true)
+}
+
+func queueAction(ud tgbotapi.Update, command string, rpcMethod string, tokens []string) {
+	ids, err := parseTorrentIDs(tokens)
+	if err != nil {
+		send(fmt.Sprintf("*%s:* %s", command, err.Error()), ud.Message.Chat.ID, false)
+		return
+	}
+
+	if _, err := rpcCall(rpcMethod, map[string]any{"ids": ids}); err != nil {
+		send(fmt.Sprintf("*%s:* %s", command, err.Error()), ud.Message.Chat.ID, false)
+		return
+	}
+
+	out, err := rpcCall("torrent_get", map[string]any{
+		"ids":    ids,
+		"fields": []string{"id", "name", "queue_position"},
+	})
+	if err != nil {
+		send(fmt.Sprintf("*%s:* done, but failed to fetch updated queue: %s", command, err.Error()), ud.Message.Chat.ID, false)
+		return
+	}
+
+	if len(out.Result.Torrents) == 0 {
+		send(fmt.Sprintf("*%s:* done", command), ud.Message.Chat.ID, false)
+		return
+	}
+
+	buf := new(bytes.Buffer)
+	buf.WriteString(fmt.Sprintf("*%s:* done\n", command))
+	for _, t := range out.Result.Torrents {
+		buf.WriteString(fmt.Sprintf("<%d> %s (queue: %d)\n", t.ID, t.Name, t.QueuePosition))
+	}
+	send(buf.String(), ud.Message.Chat.ID, true)
 }
 
 // stop takes id[s] of torrent[s] or 'all' to stop them
