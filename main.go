@@ -135,6 +135,22 @@ const (
 	Toggle honoring session-wide limits for a torrent.
 	Example: *tglobal 12 on*
 
+	*reannounce* or *ra*
+	Force tracker reannounce now.
+	Example: *reannounce 12 19*
+
+	*trackerlist* or *tls*
+	Show torrent tracker list with tier and announce URL.
+	Example: *trackerlist 12*
+
+	*trackerset*
+	Replace torrent tracker list. Use blank line between tiers.
+	Example:
+	*trackerset 12 udp://t1/announce*
+	*udp://t2/announce*
+	(blank line between tiers)
+	*udp://backup/announce*
+
 	*stop* or *sp*
 	Takes one or more torrent's IDs to stop them, or _all_ to stop all torrents.
 
@@ -818,6 +834,15 @@ func main() {
 		case "tglobal", "/tglobal", "tg", "/tg":
 			go tglobal(update, tokens[1:])
 
+		case "reannounce", "/reannounce", "ra", "/ra":
+			go queueAction(update, "reannounce", "torrent_reannounce", tokens[1:])
+
+		case "trackerlist", "/trackerlist", "tls", "/tls":
+			go trackerlist(update, tokens[1:])
+
+		case "trackerset", "/trackerset":
+			go trackerset(update, tokens[1:])
+
 		case "stop", "/stop", "sp", "/sp":
 			go stop(update, tokens[1:])
 
@@ -1048,6 +1073,19 @@ func parseTorrentIDs(tokens []string) ([]int, error) {
 		ids = append(ids, id)
 	}
 	return ids, nil
+}
+
+func commandTail(text string) string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return ""
+	}
+	for i := 0; i < len(text); i++ {
+		if text[i] == ' ' || text[i] == '\n' || text[i] == '\t' {
+			return strings.TrimSpace(text[i+1:])
+		}
+	}
+	return ""
 }
 
 // list will form and send a list of all the torrents
@@ -2168,6 +2206,78 @@ func tglobal(ud tgbotapi.Update, tokens []string) {
 		return
 	}
 	updateSingleTorrent(ud, "tglobal", torrentID, map[string]any{"honors_session_limits": enabled})
+}
+
+func trackerlist(ud tgbotapi.Update, tokens []string) {
+	if len(tokens) != 1 {
+		send("*trackerlist:* usage: trackerlist <id>", ud.Message.Chat.ID, false)
+		return
+	}
+	torrentID, err := parseIntToken(tokens[0])
+	if err != nil {
+		send("*trackerlist:* "+err.Error(), ud.Message.Chat.ID, false)
+		return
+	}
+	out, err := rpcCall("torrent_get", map[string]any{
+		"ids":    []int{torrentID},
+		"fields": []string{"id", "name", "trackers", "tracker_list"},
+	})
+	if err != nil {
+		send("*trackerlist:* "+err.Error(), ud.Message.Chat.ID, false)
+		return
+	}
+	if len(out.Result.Torrents) == 0 {
+		send(fmt.Sprintf("*trackerlist:* no torrent with id %d", torrentID), ud.Message.Chat.ID, false)
+		return
+	}
+	t := out.Result.Torrents[0]
+	buf := new(bytes.Buffer)
+	buf.WriteString(fmt.Sprintf("`<%d>` *%s*\n", t.ID, mdReplacer.Replace(t.Name)))
+	if len(t.Trackers) > 0 {
+		for _, tr := range t.Trackers {
+			buf.WriteString(fmt.Sprintf("tier %d #%d: %s\n", tr.Tier, tr.ID, tr.Announce))
+		}
+	} else if strings.TrimSpace(t.TrackerList) != "" {
+		buf.WriteString(t.TrackerList)
+	} else {
+		buf.WriteString("No trackers")
+	}
+	send(buf.String(), ud.Message.Chat.ID, true)
+}
+
+func trackerset(ud tgbotapi.Update, tokens []string) {
+	body := commandTail(ud.Message.Text)
+	if body == "" {
+		send("*trackerset:* usage: trackerset <id> <tracker_list>", ud.Message.Chat.ID, false)
+		return
+	}
+	body = strings.TrimSpace(body)
+	cut := strings.IndexAny(body, " \n\t")
+	if cut < 0 {
+		send("*trackerset:* missing tracker list content", ud.Message.Chat.ID, false)
+		return
+	}
+
+	torrentID, err := parseIntToken(body[:cut])
+	if err != nil {
+		send("*trackerset:* "+err.Error(), ud.Message.Chat.ID, false)
+		return
+	}
+	trackerList := strings.TrimSpace(body[cut+1:])
+	if trackerList == "" {
+		send("*trackerset:* missing tracker list content", ud.Message.Chat.ID, false)
+		return
+	}
+
+	if _, err := rpcCall("torrent_set", map[string]any{
+		"ids":          []int{torrentID},
+		"tracker_list": trackerList,
+	}); err != nil {
+		send("*trackerset:* "+err.Error(), ud.Message.Chat.ID, false)
+		return
+	}
+
+	send(fmt.Sprintf("*trackerset:* replaced trackers for torrent `%d`", torrentID), ud.Message.Chat.ID, true)
 }
 
 // stop takes id[s] of torrent[s] or 'all' to stop them
