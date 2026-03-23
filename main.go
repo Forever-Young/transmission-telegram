@@ -151,6 +151,18 @@ const (
 	(blank line between tiers)
 	*udp://backup/announce*
 
+	*paths* or *pa*
+	Show current download dir and torrent file paths for rename discovery.
+	Example: *paths 12*
+
+	*move* or *mv*
+	Move torrent data to a new location (quote paths with spaces).
+	Example: *move 12 "/mnt/media/TV Shows"*
+
+	*rename* or *ren*
+	Rename a file/folder path inside one torrent (quote paths with spaces).
+	Example: *rename 12 "old folder/file.mkv" "new name.mkv"*
+
 	*stop* or *sp*
 	Takes one or more torrent's IDs to stop them, or _all_ to stop all torrents.
 
@@ -759,7 +771,7 @@ func main() {
 		case "seeding", "/seeding", "sd", "/sd":
 			go seeding(update)
 
-		case "paused", "/paused", "pa", "/pa":
+		case "paused", "/paused", "/pa":
 			go paused(update)
 
 		case "checking", "/checking", "ch", "/ch":
@@ -843,6 +855,15 @@ func main() {
 		case "trackerset", "/trackerset":
 			go trackerset(update, tokens[1:])
 
+		case "paths", "/paths", "pa":
+			go paths(update, tokens[1:])
+
+		case "move", "/move", "mv", "/mv":
+			go move(update)
+
+		case "rename", "/rename", "ren", "/ren":
+			go rename(update)
+
 		case "stop", "/stop", "sp", "/sp":
 			go stop(update, tokens[1:])
 
@@ -874,7 +895,7 @@ func main() {
 			go deldata(update, tokens[1:])
 
 		case "help", "/help":
-			go send(HELP, update.Message.Chat.ID, true)
+			go sendHelp(update.Message.Chat.ID)
 
 		case "version", "/version", "ver", "/ver":
 			go getVersion(update)
@@ -889,6 +910,17 @@ func main() {
 
 		}
 	}
+}
+
+func sendHelp(chatID int64) {
+	const stopSection = "\n\t*stop* or *sp*"
+	idx := strings.Index(HELP, stopSection)
+	if idx < 0 {
+		send(HELP, chatID, true)
+		return
+	}
+	send(HELP[:idx], chatID, true)
+	send(HELP[idx:], chatID, true)
 }
 
 func rpcCall(method string, params map[string]any) (*rpcResponse, error) {
@@ -1086,6 +1118,35 @@ func commandTail(text string) string {
 		}
 	}
 	return ""
+}
+
+func splitCommandArgs(text string) []string {
+	args := make([]string, 0)
+	var current strings.Builder
+	var quote rune
+	for _, r := range text {
+		switch {
+		case quote != 0:
+			if r == quote {
+				quote = 0
+				continue
+			}
+			current.WriteRune(r)
+		case r == '"' || r == '\'':
+			quote = r
+		case r == ' ' || r == '\n' || r == '\t':
+			if current.Len() > 0 {
+				args = append(args, current.String())
+				current.Reset()
+			}
+		default:
+			current.WriteRune(r)
+		}
+	}
+	if current.Len() > 0 {
+		args = append(args, current.String())
+	}
+	return args
 }
 
 // list will form and send a list of all the torrents
@@ -2278,6 +2339,102 @@ func trackerset(ud tgbotapi.Update, tokens []string) {
 	}
 
 	send(fmt.Sprintf("*trackerset:* replaced trackers for torrent `%d`", torrentID), ud.Message.Chat.ID, true)
+}
+
+func paths(ud tgbotapi.Update, tokens []string) {
+	if len(tokens) != 1 {
+		send("*paths:* usage: paths <id>", ud.Message.Chat.ID, false)
+		return
+	}
+	torrentID, err := parseIntToken(tokens[0])
+	if err != nil {
+		send("*paths:* "+err.Error(), ud.Message.Chat.ID, false)
+		return
+	}
+	out, err := rpcCall("torrent_get", map[string]any{
+		"ids":    []int{torrentID},
+		"fields": []string{"id", "name", "download_dir", "files"},
+	})
+	if err != nil {
+		send("*paths:* "+err.Error(), ud.Message.Chat.ID, false)
+		return
+	}
+	if len(out.Result.Torrents) == 0 {
+		send(fmt.Sprintf("*paths:* no torrent with id %d", torrentID), ud.Message.Chat.ID, false)
+		return
+	}
+	t := out.Result.Torrents[0]
+	buf := new(bytes.Buffer)
+	buf.WriteString(fmt.Sprintf("`<%d>` *%s*\nDownload dir: `%s`\n", t.ID, mdReplacer.Replace(t.Name), t.DownloadDir))
+	for idx, f := range t.Files {
+		buf.WriteString(fmt.Sprintf("[%d] `%s`\n", idx, f.Name))
+	}
+	send(buf.String(), ud.Message.Chat.ID, true)
+}
+
+func move(ud tgbotapi.Update) {
+	args := splitCommandArgs(commandTail(ud.Message.Text))
+	if len(args) < 2 {
+		send("*move:* usage: move <id> <path> (quote paths with spaces)", ud.Message.Chat.ID, false)
+		return
+	}
+	torrentID, err := parseIntToken(args[0])
+	if err != nil {
+		send("*move:* "+err.Error(), ud.Message.Chat.ID, false)
+		return
+	}
+	newPath := strings.Join(args[1:], " ")
+	if _, err := rpcCall("torrent_set_location", map[string]any{
+		"ids":      []int{torrentID},
+		"location": newPath,
+		"move":     true,
+	}); err != nil {
+		send("*move:* "+err.Error(), ud.Message.Chat.ID, false)
+		return
+	}
+	out, err := rpcCall("torrent_get", map[string]any{
+		"ids":    []int{torrentID},
+		"fields": []string{"id", "name", "download_dir"},
+	})
+	if err != nil || len(out.Result.Torrents) == 0 {
+		send(fmt.Sprintf("*move:* moved torrent `%d` to `%s`", torrentID, newPath), ud.Message.Chat.ID, true)
+		return
+	}
+	t := out.Result.Torrents[0]
+	send(fmt.Sprintf("*move:* `<%d> %s` now in `%s`", t.ID, mdReplacer.Replace(t.Name), t.DownloadDir), ud.Message.Chat.ID, true)
+}
+
+func rename(ud tgbotapi.Update) {
+	args := splitCommandArgs(commandTail(ud.Message.Text))
+	if len(args) < 3 {
+		send("*rename:* usage: rename <id> <oldpath> <newname> (quote paths with spaces)", ud.Message.Chat.ID, false)
+		return
+	}
+	torrentID, err := parseIntToken(args[0])
+	if err != nil {
+		send("*rename:* "+err.Error(), ud.Message.Chat.ID, false)
+		return
+	}
+	oldPath := args[1]
+	newName := strings.Join(args[2:], " ")
+	if _, err := rpcCall("torrent_rename_path", map[string]any{
+		"ids":  []int{torrentID},
+		"path": oldPath,
+		"name": newName,
+	}); err != nil {
+		send("*rename:* "+err.Error(), ud.Message.Chat.ID, false)
+		return
+	}
+	out, err := rpcCall("torrent_get", map[string]any{
+		"ids":    []int{torrentID},
+		"fields": []string{"id", "name", "files"},
+	})
+	if err != nil || len(out.Result.Torrents) == 0 {
+		send(fmt.Sprintf("*rename:* renamed `%s` -> `%s`", oldPath, newName), ud.Message.Chat.ID, true)
+		return
+	}
+	t := out.Result.Torrents[0]
+	send(fmt.Sprintf("*rename:* updated `<%d> %s` (`%s` -> `%s`)", t.ID, mdReplacer.Replace(t.Name), oldPath, newName), ud.Message.Chat.ID, true)
 }
 
 // stop takes id[s] of torrent[s] or 'all' to stop them
