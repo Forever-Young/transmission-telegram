@@ -115,6 +115,26 @@ const (
 	Move torrents to bottom of queue.
 	Example: *qbottom 12 19*
 
+	*tlimit* or *tl*
+	Set per-torrent speed limit in KB/s (not global downlimit/uplimit).
+	Example: *tlimit 12 down 2048*
+
+	*tpeers* or *tp*
+	Set per-torrent max peers.
+	Example: *tpeers 12 60*
+
+	*tratio* or *trr*
+	Set per-torrent seed ratio limit.
+	Example: *tratio 12 1.5*
+
+	*tidle* or *ti*
+	Set per-torrent idle seeding limit (minutes).
+	Example: *tidle 12 30*
+
+	*tglobal* or *tg*
+	Toggle honoring session-wide limits for a torrent.
+	Example: *tglobal 12 on*
+
 	*stop* or *sp*
 	Takes one or more torrent's IDs to stop them, or _all_ to stop all torrents.
 
@@ -782,6 +802,21 @@ func main() {
 
 		case "qbottom", "/qbottom", "qbot", "/qbot":
 			go queueAction(update, "qbottom", "queue_move_bottom", tokens[1:])
+
+		case "tlimit", "/tlimit", "tl", "/tl":
+			go tlimit(update, tokens[1:])
+
+		case "tpeers", "/tpeers", "tp", "/tp":
+			go tpeers(update, tokens[1:])
+
+		case "tratio", "/tratio", "trr", "/trr":
+			go tratio(update, tokens[1:])
+
+		case "tidle", "/tidle", "ti", "/ti":
+			go tidle(update, tokens[1:])
+
+		case "tglobal", "/tglobal", "tg", "/tg":
+			go tglobal(update, tokens[1:])
 
 		case "stop", "/stop", "sp", "/sp":
 			go stop(update, tokens[1:])
@@ -1734,13 +1769,44 @@ func info(ud tgbotapi.Update, tokens []string) {
 			}
 		}
 
+		limitsInfo := ""
+		limitsOut, limitsErr := rpcCall("torrent_get", map[string]any{
+			"ids": []int{torrentID},
+			"fields": []string{
+				"download_limit", "download_limited", "upload_limit", "upload_limited",
+				"peer_limit", "seed_ratio_limit", "seed_ratio_mode",
+				"seed_idle_limit", "seed_idle_mode", "honors_session_limits",
+			},
+		})
+		if limitsErr == nil && len(limitsOut.Result.Torrents) > 0 {
+			lt := limitsOut.Result.Torrents[0]
+			down := "off"
+			if lt.DownloadLimited {
+				down = fmt.Sprintf("%d KB/s", lt.DownloadLimit)
+			}
+			up := "off"
+			if lt.UploadLimited {
+				up = fmt.Sprintf("%d KB/s", lt.UploadLimit)
+			}
+			seedRatio := "default"
+			if lt.SeedRatioMode == 1 {
+				seedRatio = fmt.Sprintf("%.2f", lt.SeedRatioLimit)
+			}
+			seedIdle := "default"
+			if lt.SeedIdleMode == 1 {
+				seedIdle = fmt.Sprintf("%d min", lt.SeedIdleLimit)
+			}
+			limitsInfo = fmt.Sprintf("\nLimits: DL `%s` | UP `%s` | peers `%d`\nSeed: ratio `%s` | idle `%s` | global `%t`",
+				down, up, lt.PeerLimit, seedRatio, seedIdle, lt.HonorsSessionLimits)
+		}
+
 		// format the info
 		torrentName := mdReplacer.Replace(torrent.Name) // escape markdown
-		info := fmt.Sprintf("`<%d>` *%s*\n%s *%s* of *%s* (*%.1f%%*) ↓ *%s*  ↑ *%s* R: *%s*\nDL: *%s* UP: *%s*\nAdded: *%s*, ETA: *%s*\nTrackers: `%s`\nFiles: use `files %d`",
+		info := fmt.Sprintf("`<%d>` *%s*\n%s *%s* of *%s* (*%.1f%%*) ↓ *%s*  ↑ *%s* R: *%s*\nDL: *%s* UP: *%s*\nAdded: *%s*, ETA: *%s*\nTrackers: `%s`%s\nFiles: use `files %d`",
 			torrent.ID, torrentName, torrent.TorrentStatus(), humanize.Bytes(torrent.Have()), humanize.Bytes(torrent.SizeWhenDone),
 			torrent.PercentDone*100, humanize.Bytes(torrent.RateDownload), humanize.Bytes(torrent.RateUpload), torrent.Ratio(),
 			humanize.Bytes(torrent.DownloadedEver), humanize.Bytes(torrent.UploadedEver), time.Unix(torrent.AddedDate, 0).Format(time.Stamp),
-			torrent.ETA(), trackers, torrent.ID)
+			torrent.ETA(), trackers, limitsInfo, torrent.ID)
 
 		// send it
 		msgID := send(info, ud.Message.Chat.ID, true)
@@ -1759,11 +1825,11 @@ func info(ud tgbotapi.Update, tokens []string) {
 				}
 
 				torrentName := mdReplacer.Replace(torrent.Name)
-				info := fmt.Sprintf("`<%d>` *%s*\n%s *%s* of *%s* (*%.1f%%*) ↓ *%s*  ↑ *%s* R: *%s*\nDL: *%s* UP: *%s*\nAdded: *%s*, ETA: *%s*\nTrackers: `%s`\nFiles: use `files %d`",
+				info := fmt.Sprintf("`<%d>` *%s*\n%s *%s* of *%s* (*%.1f%%*) ↓ *%s*  ↑ *%s* R: *%s*\nDL: *%s* UP: *%s*\nAdded: *%s*, ETA: *%s*\nTrackers: `%s`%s\nFiles: use `files %d`",
 					torrent.ID, torrentName, torrent.TorrentStatus(), humanize.Bytes(torrent.Have()), humanize.Bytes(torrent.SizeWhenDone),
 					torrent.PercentDone*100, humanize.Bytes(torrent.RateDownload), humanize.Bytes(torrent.RateUpload), torrent.Ratio(),
 					humanize.Bytes(torrent.DownloadedEver), humanize.Bytes(torrent.UploadedEver), time.Unix(torrent.AddedDate, 0).Format(time.Stamp),
-					torrent.ETA(), trackers, torrent.ID)
+					torrent.ETA(), trackers, limitsInfo, torrent.ID)
 
 				// update the message
 				editConf := tgbotapi.NewEditMessageText(ud.Message.Chat.ID, msgID, info)
@@ -1776,10 +1842,10 @@ func info(ud tgbotapi.Update, tokens []string) {
 
 			// at the end write dashes to indicate that we are done being live.
 			torrentName := mdReplacer.Replace(torrent.Name)
-			info := fmt.Sprintf("`<%d>` *%s*\n%s *%s* of *%s* (*%.1f%%*) ↓ *- B*  ↑ *- B* R: *%s*\nDL: *%s* UP: *%s*\nAdded: *%s*, ETA: *-*\nTrackers: `%s`\nFiles: use `files %d`",
+			info := fmt.Sprintf("`<%d>` *%s*\n%s *%s* of *%s* (*%.1f%%*) ↓ *- B*  ↑ *- B* R: *%s*\nDL: *%s* UP: *%s*\nAdded: *%s*, ETA: *-*\nTrackers: `%s`%s\nFiles: use `files %d`",
 				torrent.ID, torrentName, torrent.TorrentStatus(), humanize.Bytes(torrent.Have()), humanize.Bytes(torrent.SizeWhenDone),
 				torrent.PercentDone*100, torrent.Ratio(), humanize.Bytes(torrent.DownloadedEver), humanize.Bytes(torrent.UploadedEver),
-				time.Unix(torrent.AddedDate, 0).Format(time.Stamp), trackers, torrent.ID)
+				time.Unix(torrent.AddedDate, 0).Format(time.Stamp), trackers, limitsInfo, torrent.ID)
 
 			editConf := tgbotapi.NewEditMessageText(ud.Message.Chat.ID, msgID, info)
 			editConf.ParseMode = tgbotapi.ModeMarkdown
@@ -1976,6 +2042,132 @@ func queueAction(ud tgbotapi.Update, command string, rpcMethod string, tokens []
 		buf.WriteString(fmt.Sprintf("<%d> %s (queue: %d)\n", t.ID, t.Name, t.QueuePosition))
 	}
 	send(buf.String(), ud.Message.Chat.ID, true)
+}
+
+func updateSingleTorrent(ud tgbotapi.Update, command string, torrentID int, params map[string]any) {
+	params["ids"] = []int{torrentID}
+	if _, err := rpcCall("torrent_set", params); err != nil {
+		send(fmt.Sprintf("*%s:* %s", command, err.Error()), ud.Message.Chat.ID, false)
+		return
+	}
+	out, err := rpcCall("torrent_get", map[string]any{
+		"ids":    []int{torrentID},
+		"fields": []string{"id", "name"},
+	})
+	if err != nil || len(out.Result.Torrents) == 0 {
+		send(fmt.Sprintf("*%s:* updated torrent %d", command, torrentID), ud.Message.Chat.ID, false)
+		return
+	}
+	send(fmt.Sprintf("*%s:* updated `<%d> %s`", command, torrentID, mdReplacer.Replace(out.Result.Torrents[0].Name)), ud.Message.Chat.ID, true)
+}
+
+func tlimit(ud tgbotapi.Update, tokens []string) {
+	if len(tokens) != 3 {
+		send("*tlimit:* usage: tlimit <id> <down|up> <kbps>", ud.Message.Chat.ID, false)
+		return
+	}
+	torrentID, err := parseIntToken(tokens[0])
+	if err != nil {
+		send("*tlimit:* "+err.Error(), ud.Message.Chat.ID, false)
+		return
+	}
+	value, err := strconv.Atoi(tokens[2])
+	if err != nil || value < 0 {
+		send("*tlimit:* kbps must be a non-negative number", ud.Message.Chat.ID, false)
+		return
+	}
+	dir := strings.ToLower(tokens[1])
+	params := map[string]any{}
+	switch dir {
+	case "down":
+		params["download_limit"] = value
+		params["download_limited"] = true
+	case "up":
+		params["upload_limit"] = value
+		params["upload_limited"] = true
+	default:
+		send("*tlimit:* direction must be down or up", ud.Message.Chat.ID, false)
+		return
+	}
+	updateSingleTorrent(ud, "tlimit", torrentID, params)
+}
+
+func tpeers(ud tgbotapi.Update, tokens []string) {
+	if len(tokens) != 2 {
+		send("*tpeers:* usage: tpeers <id> <count>", ud.Message.Chat.ID, false)
+		return
+	}
+	torrentID, err := parseIntToken(tokens[0])
+	if err != nil {
+		send("*tpeers:* "+err.Error(), ud.Message.Chat.ID, false)
+		return
+	}
+	count, err := strconv.Atoi(tokens[1])
+	if err != nil || count < 0 {
+		send("*tpeers:* count must be a non-negative number", ud.Message.Chat.ID, false)
+		return
+	}
+	updateSingleTorrent(ud, "tpeers", torrentID, map[string]any{"peer_limit": count})
+}
+
+func tratio(ud tgbotapi.Update, tokens []string) {
+	if len(tokens) != 2 {
+		send("*tratio:* usage: tratio <id> <limit>", ud.Message.Chat.ID, false)
+		return
+	}
+	torrentID, err := parseIntToken(tokens[0])
+	if err != nil {
+		send("*tratio:* "+err.Error(), ud.Message.Chat.ID, false)
+		return
+	}
+	limit, err := strconv.ParseFloat(tokens[1], 64)
+	if err != nil || limit < 0 {
+		send("*tratio:* limit must be a non-negative number", ud.Message.Chat.ID, false)
+		return
+	}
+	updateSingleTorrent(ud, "tratio", torrentID, map[string]any{"seed_ratio_limit": limit, "seed_ratio_mode": 1})
+}
+
+func tidle(ud tgbotapi.Update, tokens []string) {
+	if len(tokens) != 2 {
+		send("*tidle:* usage: tidle <id> <minutes>", ud.Message.Chat.ID, false)
+		return
+	}
+	torrentID, err := parseIntToken(tokens[0])
+	if err != nil {
+		send("*tidle:* "+err.Error(), ud.Message.Chat.ID, false)
+		return
+	}
+	minutes, err := strconv.Atoi(tokens[1])
+	if err != nil || minutes < 0 {
+		send("*tidle:* minutes must be a non-negative number", ud.Message.Chat.ID, false)
+		return
+	}
+	updateSingleTorrent(ud, "tidle", torrentID, map[string]any{"seed_idle_limit": minutes, "seed_idle_mode": 1})
+}
+
+func tglobal(ud tgbotapi.Update, tokens []string) {
+	if len(tokens) != 2 {
+		send("*tglobal:* usage: tglobal <id> <on|off>", ud.Message.Chat.ID, false)
+		return
+	}
+	torrentID, err := parseIntToken(tokens[0])
+	if err != nil {
+		send("*tglobal:* "+err.Error(), ud.Message.Chat.ID, false)
+		return
+	}
+	state := strings.ToLower(tokens[1])
+	var enabled bool
+	switch state {
+	case "on":
+		enabled = true
+	case "off":
+		enabled = false
+	default:
+		send("*tglobal:* value must be on or off", ud.Message.Chat.ID, false)
+		return
+	}
+	updateSingleTorrent(ud, "tglobal", torrentID, map[string]any{"honors_session_limits": enabled})
 }
 
 // stop takes id[s] of torrent[s] or 'all' to stop them
