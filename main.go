@@ -2,15 +2,20 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
+	stderrors "errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"net/url"
 	"os"
 	"regexp"
+	gosort "sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -72,6 +77,23 @@ const (
 
 	*info* or *in*
 	Takes one or more torrent's IDs to list more info about them.
+	Use *files* for detailed file-level controls.
+
+	*files* or *fi*
+	Show file numbers (index starts at 0), wanted/skip, priority, size and completion.
+	Example: *files 12*
+
+	*want* or *wa*
+	Mark one torrent's files as wanted. Supports lists/ranges.
+	Example: *want 12 1,2,5-8*
+
+	*skip* or *sk*
+	Mark one torrent's files as unwanted. Supports lists/ranges.
+	Example: *skip 12 0,3-5*
+
+	*fprio* or *fp*
+	Set file priority (high|normal|low) for one torrent's files.
+	Example: *fprio 12 high 1,2,5-8*
 
 	*stop* or *sp*
 	Takes one or more torrent's IDs to stop them, or _all_ to stop all torrents.
@@ -140,6 +162,10 @@ var (
 	// logging
 	logger = log.New(os.Stdout, "", log.LstdFlags)
 
+	rpcHTTPClient = &http.Client{Timeout: 30 * time.Second}
+	rpcSessionID  string
+	rpcSessionMu  sync.Mutex
+
 	// interval in seconds for live updates, affects: "active", "info", "speed", "head", "tail"
 	interval time.Duration = 5
 	// duration controls how many intervals will happen
@@ -153,6 +179,307 @@ var (
 		"_", "-",
 		"`", "'")
 )
+
+type rpcRequest struct {
+	JSONRPC string         `json:"jsonrpc"`
+	Params  map[string]any `json:"params,omitempty"`
+	Method  string         `json:"method"`
+	ID      int64          `json:"id"`
+}
+
+type rpcResponse struct {
+	JSONRPC   string          `json:"jsonrpc"`
+	ResultRaw json.RawMessage `json:"result"`
+	Arguments struct {
+		Torrents []rpcTorrent `json:"torrents"`
+	} `json:"arguments"`
+	Result struct {
+		Torrents []rpcTorrent `json:"torrents"`
+	}
+	Error *struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+		Data    struct {
+			ErrorString string `json:"error_string"`
+		} `json:"data"`
+	} `json:"error"`
+}
+
+func (r *rpcResponse) normalize() error {
+	if len(r.Arguments.Torrents) > 0 {
+		r.Result.Torrents = r.Arguments.Torrents
+	}
+	if len(r.ResultRaw) == 0 || string(r.ResultRaw) == "null" {
+		return nil
+	}
+
+	var obj struct {
+		Torrents []rpcTorrent `json:"torrents"`
+	}
+	if err := json.Unmarshal(r.ResultRaw, &obj); err == nil {
+		if len(obj.Torrents) > 0 {
+			r.Result.Torrents = obj.Torrents
+		}
+		return nil
+	}
+
+	var status string
+	if err := json.Unmarshal(r.ResultRaw, &status); err == nil {
+		if status != "success" {
+			return stderrors.New(status)
+		}
+	}
+
+	for i := range r.Result.Torrents {
+		t := &r.Result.Torrents[i]
+		if t.QueuePosition == 0 && t.QueuePositionLegacy != 0 {
+			t.QueuePosition = t.QueuePositionLegacy
+		}
+		if len(t.FileStats) == 0 && len(t.FileStatsLegacy) > 0 {
+			t.FileStats = t.FileStatsLegacy
+		}
+		if t.TrackerList == "" && t.TrackerListLegacy != "" {
+			t.TrackerList = t.TrackerListLegacy
+		}
+		if t.DownloadDir == "" && t.DownloadDirLegacy != "" {
+			t.DownloadDir = t.DownloadDirLegacy
+		}
+		if t.DownloadLimit == 0 && t.DownloadLimitLegacy != 0 {
+			t.DownloadLimit = t.DownloadLimitLegacy
+		}
+		if !t.DownloadLimited && t.DownloadLimitedOld {
+			t.DownloadLimited = t.DownloadLimitedOld
+		}
+		if t.UploadLimit == 0 && t.UploadLimitLegacy != 0 {
+			t.UploadLimit = t.UploadLimitLegacy
+		}
+		if !t.UploadLimited && t.UploadLimitedOld {
+			t.UploadLimited = t.UploadLimitedOld
+		}
+		if t.PeerLimit == 0 && t.PeerLimitLegacy != 0 {
+			t.PeerLimit = t.PeerLimitLegacy
+		}
+		if t.SeedRatioLimit == 0 && t.SeedRatioLimitOld != 0 {
+			t.SeedRatioLimit = t.SeedRatioLimitOld
+		}
+		if t.SeedRatioMode == 0 && t.SeedRatioModeOld != 0 {
+			t.SeedRatioMode = t.SeedRatioModeOld
+		}
+		if t.SeedIdleLimit == 0 && t.SeedIdleLimitOld != 0 {
+			t.SeedIdleLimit = t.SeedIdleLimitOld
+		}
+		if t.SeedIdleMode == 0 && t.SeedIdleModeOld != 0 {
+			t.SeedIdleMode = t.SeedIdleModeOld
+		}
+		if !t.HonorsSessionLimits && t.HonorsSessionOld {
+			t.HonorsSessionLimits = t.HonorsSessionOld
+		}
+		if !t.SequentialDownload && t.SequentialOld {
+			t.SequentialDownload = t.SequentialOld
+		}
+		if t.SequentialFromPiece == 0 && t.SequentialFromOld != 0 {
+			t.SequentialFromPiece = t.SequentialFromOld
+		}
+		for j := range t.Files {
+			if t.Files[j].BytesCompleted == 0 && t.Files[j].BytesOld != 0 {
+				t.Files[j].BytesCompleted = t.Files[j].BytesOld
+			}
+			if t.Files[j].BeginPiece == 0 && t.Files[j].BeginOld != 0 {
+				t.Files[j].BeginPiece = t.Files[j].BeginOld
+			}
+			if t.Files[j].EndPiece == 0 && t.Files[j].EndOld != 0 {
+				t.Files[j].EndPiece = t.Files[j].EndOld
+			}
+		}
+		for j := range t.FileStats {
+			if t.FileStats[j].BytesCompleted == 0 && t.FileStats[j].BytesOld != 0 {
+				t.FileStats[j].BytesCompleted = t.FileStats[j].BytesOld
+			}
+		}
+	}
+
+	return nil
+}
+
+func toLegacyMethod(method string) string {
+	replacer := strings.NewReplacer(
+		"torrent_get", "torrent-get",
+		"torrent_set", "torrent-set",
+		"torrent_start_now", "torrent-start-now",
+		"queue_move_top", "queue-move-top",
+		"queue_move_up", "queue-move-up",
+		"queue_move_down", "queue-move-down",
+		"queue_move_bottom", "queue-move-bottom",
+		"torrent_reannounce", "torrent-reannounce",
+		"torrent_set_location", "torrent-set-location",
+		"torrent_rename_path", "torrent-rename-path",
+		"session_get", "session-get",
+		"session_set", "session-set",
+	)
+	return replacer.Replace(method)
+}
+
+func toLegacyParams(params map[string]any) map[string]any {
+	if params == nil {
+		return nil
+	}
+	out := make(map[string]any, len(params))
+	for k, v := range params {
+		switch k {
+		case "fields":
+			fields, ok := v.([]string)
+			if !ok {
+				out[k] = v
+				continue
+			}
+			mapped := make([]string, 0, len(fields))
+			for _, f := range fields {
+				switch f {
+				case "queue_position":
+					mapped = append(mapped, "queuePosition")
+				case "file_stats":
+					mapped = append(mapped, "fileStats")
+				case "tracker_list":
+					mapped = append(mapped, "trackerList")
+				case "download_dir":
+					mapped = append(mapped, "downloadDir")
+				case "download_limit":
+					mapped = append(mapped, "downloadLimit")
+				case "download_limited":
+					mapped = append(mapped, "downloadLimited")
+				case "upload_limit":
+					mapped = append(mapped, "uploadLimit")
+				case "upload_limited":
+					mapped = append(mapped, "uploadLimited")
+				case "peer_limit":
+					mapped = append(mapped, "peer-limit")
+				case "seed_ratio_limit":
+					mapped = append(mapped, "seedRatioLimit")
+				case "seed_ratio_mode":
+					mapped = append(mapped, "seedRatioMode")
+				case "seed_idle_limit":
+					mapped = append(mapped, "seedIdleLimit")
+				case "seed_idle_mode":
+					mapped = append(mapped, "seedIdleMode")
+				case "honors_session_limits":
+					mapped = append(mapped, "honorsSessionLimits")
+				default:
+					mapped = append(mapped, f)
+				}
+			}
+			out[k] = mapped
+		case "files_wanted":
+			out["files-wanted"] = v
+		case "files_unwanted":
+			out["files-unwanted"] = v
+		case "priority_high":
+			out["priority-high"] = v
+		case "priority_normal":
+			out["priority-normal"] = v
+		case "priority_low":
+			out["priority-low"] = v
+		case "tracker_list":
+			out["trackerList"] = v
+		case "download_limit":
+			out["downloadLimit"] = v
+		case "download_limited":
+			out["downloadLimited"] = v
+		case "upload_limit":
+			out["uploadLimit"] = v
+		case "upload_limited":
+			out["uploadLimited"] = v
+		case "peer_limit":
+			out["peer-limit"] = v
+		case "seed_ratio_limit":
+			out["seedRatioLimit"] = v
+		case "seed_ratio_mode":
+			out["seedRatioMode"] = v
+		case "seed_idle_limit":
+			out["seedIdleLimit"] = v
+		case "seed_idle_mode":
+			out["seedIdleMode"] = v
+		case "honors_session_limits":
+			out["honorsSessionLimits"] = v
+		case "queue_position":
+			out["queuePosition"] = v
+		default:
+			out[k] = v
+		}
+	}
+	return out
+}
+
+func shouldFallbackToLegacy(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "method name not recognized") ||
+		strings.Contains(msg, "no fields specified")
+}
+
+type rpcTorrent struct {
+	ID                  int              `json:"id"`
+	Name                string           `json:"name"`
+	QueuePosition       int              `json:"queue_position"`
+	QueuePositionLegacy int              `json:"queuePosition"`
+	Files               []rpcTorrentFile `json:"files"`
+	FileStats           []rpcFileStat    `json:"file_stats"`
+	FileStatsLegacy     []rpcFileStat    `json:"fileStats"`
+	Trackers            []rpcTracker     `json:"trackers"`
+	TrackerList         string           `json:"tracker_list"`
+	TrackerListLegacy   string           `json:"trackerList"`
+	DownloadDir         string           `json:"download_dir"`
+	DownloadDirLegacy   string           `json:"downloadDir"`
+	DownloadLimit       int              `json:"download_limit"`
+	DownloadLimitLegacy int              `json:"downloadLimit"`
+	DownloadLimited     bool             `json:"download_limited"`
+	DownloadLimitedOld  bool             `json:"downloadLimited"`
+	UploadLimit         int              `json:"upload_limit"`
+	UploadLimitLegacy   int              `json:"uploadLimit"`
+	UploadLimited       bool             `json:"upload_limited"`
+	UploadLimitedOld    bool             `json:"uploadLimited"`
+	PeerLimit           int              `json:"peer_limit"`
+	PeerLimitLegacy     int              `json:"peer-limit"`
+	SeedRatioLimit      float64          `json:"seed_ratio_limit"`
+	SeedRatioLimitOld   float64          `json:"seedRatioLimit"`
+	SeedRatioMode       int              `json:"seed_ratio_mode"`
+	SeedRatioModeOld    int              `json:"seedRatioMode"`
+	SeedIdleLimit       int              `json:"seed_idle_limit"`
+	SeedIdleLimitOld    int              `json:"seedIdleLimit"`
+	SeedIdleMode        int              `json:"seed_idle_mode"`
+	SeedIdleModeOld     int              `json:"seedIdleMode"`
+	HonorsSessionLimits bool             `json:"honors_session_limits"`
+	HonorsSessionOld    bool             `json:"honorsSessionLimits"`
+	SequentialDownload  bool             `json:"sequential_download"`
+	SequentialOld       bool             `json:"sequentialDownload"`
+	SequentialFromPiece int              `json:"sequential_download_from_piece"`
+	SequentialFromOld   int              `json:"sequentialDownloadFromPiece"`
+}
+
+type rpcTorrentFile struct {
+	BytesCompleted uint64 `json:"bytes_completed"`
+	BytesOld       uint64 `json:"bytesCompleted"`
+	Length         uint64 `json:"length"`
+	Name           string `json:"name"`
+	BeginPiece     int    `json:"begin_piece"`
+	BeginOld       int    `json:"beginPiece"`
+	EndPiece       int    `json:"end_piece"`
+	EndOld         int    `json:"endPiece"`
+}
+
+type rpcFileStat struct {
+	BytesCompleted uint64 `json:"bytes_completed"`
+	BytesOld       uint64 `json:"bytesCompleted"`
+	Wanted         bool   `json:"wanted"`
+	Priority       int    `json:"priority"`
+}
+
+type rpcTracker struct {
+	ID       int    `json:"id"`
+	Tier     int    `json:"tier"`
+	Announce string `json:"announce"`
+}
 
 // we need a type for masters for the flag package to parse them as a slice
 type masterSlice []string
@@ -409,6 +736,18 @@ func main() {
 		case "info", "/info", "in", "/in":
 			go info(update, tokens[1:])
 
+		case "files", "/files", "fi", "/fi":
+			go files(update, tokens[1:])
+
+		case "want", "/want", "wa", "/wa":
+			go want(update, tokens[1:])
+
+		case "skip", "/skip", "sk", "/sk":
+			go skip(update, tokens[1:])
+
+		case "fprio", "/fprio", "fp", "/fp":
+			go fprio(update, tokens[1:])
+
 		case "stop", "/stop", "sp", "/sp":
 			go stop(update, tokens[1:])
 
@@ -454,6 +793,175 @@ func main() {
 			go send("No such command, try /help", update.Message.Chat.ID, false)
 
 		}
+	}
+}
+
+func rpcCall(method string, params map[string]any) (*rpcResponse, error) {
+	call := func(callMethod string, callParams map[string]any, legacy bool) (*rpcResponse, error) {
+		var body []byte
+		var err error
+		if legacy {
+			reqBody := map[string]any{
+				"method":    callMethod,
+				"arguments": callParams,
+			}
+			body, err = json.Marshal(reqBody)
+		} else {
+			reqBody := rpcRequest{
+				JSONRPC: "2.0",
+				Method:  callMethod,
+				Params:  callParams,
+				ID:      time.Now().UnixNano(),
+			}
+			body, err = json.Marshal(reqBody)
+		}
+		if err != nil {
+			return nil, err
+		}
+
+		for try := 0; try < 2; try++ {
+			req, err := http.NewRequest(http.MethodPost, RPCURL, bytes.NewReader(body))
+			if err != nil {
+				return nil, err
+			}
+			req.Header.Set("Content-Type", "application/json")
+			if Username != "" || Password != "" {
+				req.SetBasicAuth(Username, Password)
+			}
+
+			rpcSessionMu.Lock()
+			currentSessionID := rpcSessionID
+			rpcSessionMu.Unlock()
+			if currentSessionID != "" {
+				req.Header.Set("X-Transmission-Session-Id", currentSessionID)
+			}
+
+			resp, err := rpcHTTPClient.Do(req)
+			if err != nil {
+				return nil, err
+			}
+			if resp.StatusCode == http.StatusConflict {
+				newSessionID := resp.Header.Get("X-Transmission-Session-Id")
+				resp.Body.Close()
+				if newSessionID == "" {
+					return nil, fmt.Errorf("rpc 409 without session id")
+				}
+				rpcSessionMu.Lock()
+				rpcSessionID = newSessionID
+				rpcSessionMu.Unlock()
+				continue
+			}
+
+			raw, err := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if err != nil {
+				return nil, err
+			}
+
+			out := &rpcResponse{}
+			if err := json.Unmarshal(raw, out); err != nil {
+				return nil, err
+			}
+			if out.Error != nil {
+				if out.Error.Data.ErrorString != "" {
+					return nil, fmt.Errorf("%s: %s", out.Error.Message, out.Error.Data.ErrorString)
+				}
+				return nil, fmt.Errorf("%s", out.Error.Message)
+			}
+			if err := out.normalize(); err != nil {
+				return nil, err
+			}
+			return out, nil
+		}
+		return nil, fmt.Errorf("rpc request failed after session retry")
+	}
+
+	out, err := call(method, params, false)
+	if shouldFallbackToLegacy(err) {
+		return call(toLegacyMethod(method), toLegacyParams(params), true)
+	}
+	return out, err
+}
+
+func parseIntToken(token string) (int, error) {
+	v, err := strconv.Atoi(token)
+	if err != nil {
+		return 0, fmt.Errorf("%q is not a number", token)
+	}
+	return v, nil
+}
+
+func parseFileSelection(tokens []string) ([]int, error) {
+	joined := strings.Join(tokens, ",")
+	if joined == "" {
+		return nil, fmt.Errorf("no file numbers provided")
+	}
+	chunks := strings.Split(joined, ",")
+	seen := make(map[int]struct{})
+	files := make([]int, 0, len(chunks))
+	for _, chunk := range chunks {
+		chunk = strings.TrimSpace(chunk)
+		if chunk == "" {
+			continue
+		}
+		if strings.Contains(chunk, "-") {
+			bits := strings.SplitN(chunk, "-", 2)
+			if len(bits) != 2 {
+				return nil, fmt.Errorf("invalid range %q", chunk)
+			}
+			start, err := parseIntToken(bits[0])
+			if err != nil {
+				return nil, err
+			}
+			end, err := parseIntToken(bits[1])
+			if err != nil {
+				return nil, err
+			}
+			if start > end {
+				return nil, fmt.Errorf("invalid range %q", chunk)
+			}
+			for i := start; i <= end; i++ {
+				if _, ok := seen[i]; ok {
+					continue
+				}
+				seen[i] = struct{}{}
+				files = append(files, i)
+			}
+			continue
+		}
+		idx, err := parseIntToken(chunk)
+		if err != nil {
+			return nil, err
+		}
+		if _, ok := seen[idx]; ok {
+			continue
+		}
+		seen[idx] = struct{}{}
+		files = append(files, idx)
+	}
+	gosort.Ints(files)
+	return files, nil
+}
+
+func validateFileBounds(files []int, max int) error {
+	for _, f := range files {
+		if f < 0 || f >= max {
+			return fmt.Errorf("file %d is out of bounds (0-%d)", f, max-1)
+		}
+	}
+	return nil
+}
+
+func priorityName(p int) string {
+	switch p {
+	case -1:
+		return "low"
+	case 0:
+		return "normal"
+	case 1:
+		return "high"
+	default:
+		return fmt.Sprintf("unknown(%d)", p)
 	}
 }
 
@@ -1178,11 +1686,11 @@ func info(ud tgbotapi.Update, tokens []string) {
 
 		// format the info
 		torrentName := mdReplacer.Replace(torrent.Name) // escape markdown
-		info := fmt.Sprintf("`<%d>` *%s*\n%s *%s* of *%s* (*%.1f%%*) ↓ *%s*  ↑ *%s* R: *%s*\nDL: *%s* UP: *%s*\nAdded: *%s*, ETA: *%s*\nTrackers: `%s`",
+		info := fmt.Sprintf("`<%d>` *%s*\n%s *%s* of *%s* (*%.1f%%*) ↓ *%s*  ↑ *%s* R: *%s*\nDL: *%s* UP: *%s*\nAdded: *%s*, ETA: *%s*\nTrackers: `%s`\nFiles: use `files %d`",
 			torrent.ID, torrentName, torrent.TorrentStatus(), humanize.Bytes(torrent.Have()), humanize.Bytes(torrent.SizeWhenDone),
 			torrent.PercentDone*100, humanize.Bytes(torrent.RateDownload), humanize.Bytes(torrent.RateUpload), torrent.Ratio(),
 			humanize.Bytes(torrent.DownloadedEver), humanize.Bytes(torrent.UploadedEver), time.Unix(torrent.AddedDate, 0).Format(time.Stamp),
-			torrent.ETA(), trackers)
+			torrent.ETA(), trackers, torrent.ID)
 
 		// send it
 		msgID := send(info, ud.Message.Chat.ID, true)
@@ -1201,11 +1709,11 @@ func info(ud tgbotapi.Update, tokens []string) {
 				}
 
 				torrentName := mdReplacer.Replace(torrent.Name)
-				info := fmt.Sprintf("`<%d>` *%s*\n%s *%s* of *%s* (*%.1f%%*) ↓ *%s*  ↑ *%s* R: *%s*\nDL: *%s* UP: *%s*\nAdded: *%s*, ETA: *%s*\nTrackers: `%s`",
+				info := fmt.Sprintf("`<%d>` *%s*\n%s *%s* of *%s* (*%.1f%%*) ↓ *%s*  ↑ *%s* R: *%s*\nDL: *%s* UP: *%s*\nAdded: *%s*, ETA: *%s*\nTrackers: `%s`\nFiles: use `files %d`",
 					torrent.ID, torrentName, torrent.TorrentStatus(), humanize.Bytes(torrent.Have()), humanize.Bytes(torrent.SizeWhenDone),
 					torrent.PercentDone*100, humanize.Bytes(torrent.RateDownload), humanize.Bytes(torrent.RateUpload), torrent.Ratio(),
 					humanize.Bytes(torrent.DownloadedEver), humanize.Bytes(torrent.UploadedEver), time.Unix(torrent.AddedDate, 0).Format(time.Stamp),
-					torrent.ETA(), trackers)
+					torrent.ETA(), trackers, torrent.ID)
 
 				// update the message
 				editConf := tgbotapi.NewEditMessageText(ud.Message.Chat.ID, msgID, info)
@@ -1218,16 +1726,172 @@ func info(ud tgbotapi.Update, tokens []string) {
 
 			// at the end write dashes to indicate that we are done being live.
 			torrentName := mdReplacer.Replace(torrent.Name)
-			info := fmt.Sprintf("`<%d>` *%s*\n%s *%s* of *%s* (*%.1f%%*) ↓ *- B*  ↑ *- B* R: *%s*\nDL: *%s* UP: *%s*\nAdded: *%s*, ETA: *-*\nTrackers: `%s`",
+			info := fmt.Sprintf("`<%d>` *%s*\n%s *%s* of *%s* (*%.1f%%*) ↓ *- B*  ↑ *- B* R: *%s*\nDL: *%s* UP: *%s*\nAdded: *%s*, ETA: *-*\nTrackers: `%s`\nFiles: use `files %d`",
 				torrent.ID, torrentName, torrent.TorrentStatus(), humanize.Bytes(torrent.Have()), humanize.Bytes(torrent.SizeWhenDone),
 				torrent.PercentDone*100, torrent.Ratio(), humanize.Bytes(torrent.DownloadedEver), humanize.Bytes(torrent.UploadedEver),
-				time.Unix(torrent.AddedDate, 0).Format(time.Stamp), trackers)
+				time.Unix(torrent.AddedDate, 0).Format(time.Stamp), trackers, torrent.ID)
 
 			editConf := tgbotapi.NewEditMessageText(ud.Message.Chat.ID, msgID, info)
 			editConf.ParseMode = tgbotapi.ModeMarkdown
 			Bot.Send(editConf)
 		}(torrentID, msgID)
 	}
+}
+
+func files(ud tgbotapi.Update, tokens []string) {
+	if len(tokens) != 1 {
+		send("*files:* usage: files <id>", ud.Message.Chat.ID, false)
+		return
+	}
+	torrentID, err := parseIntToken(tokens[0])
+	if err != nil {
+		send("*files:* "+err.Error(), ud.Message.Chat.ID, false)
+		return
+	}
+	out, err := rpcCall("torrent_get", map[string]any{
+		"ids":    []int{torrentID},
+		"fields": []string{"id", "name", "files", "file_stats"},
+	})
+	if err != nil {
+		send("*files:* "+err.Error(), ud.Message.Chat.ID, false)
+		return
+	}
+	if len(out.Result.Torrents) == 0 {
+		send(fmt.Sprintf("*files:* no torrent with id %d", torrentID), ud.Message.Chat.ID, false)
+		return
+	}
+	t := out.Result.Torrents[0]
+	buf := new(bytes.Buffer)
+	buf.WriteString(fmt.Sprintf("`<%d>` *%s*\n", t.ID, mdReplacer.Replace(t.Name)))
+	for idx, file := range t.Files {
+		fileStat := rpcFileStat{}
+		if idx < len(t.FileStats) {
+			fileStat = t.FileStats[idx]
+		}
+		progress := 0.0
+		if file.Length > 0 {
+			progress = float64(fileStat.BytesCompleted) * 100 / float64(file.Length)
+		}
+		state := "skip"
+		if fileStat.Wanted {
+			state = "want"
+		}
+		buf.WriteString(fmt.Sprintf("[%d] %s | %s | %s | %s / %s (%.1f%%)\n",
+			idx, state, priorityName(fileStat.Priority), file.Name,
+			humanize.Bytes(fileStat.BytesCompleted), humanize.Bytes(file.Length), progress))
+	}
+	send(buf.String(), ud.Message.Chat.ID, true)
+}
+
+func want(ud tgbotapi.Update, tokens []string) {
+	updateFileSelection(ud, "want", tokens, true)
+}
+
+func skip(ud tgbotapi.Update, tokens []string) {
+	updateFileSelection(ud, "skip", tokens, false)
+}
+
+func updateFileSelection(ud tgbotapi.Update, command string, tokens []string, wanted bool) {
+	if len(tokens) < 2 {
+		send(fmt.Sprintf("*%s:* usage: %s <id> <file...>", command, command), ud.Message.Chat.ID, false)
+		return
+	}
+	torrentID, err := parseIntToken(tokens[0])
+	if err != nil {
+		send(fmt.Sprintf("*%s:* %s", command, err.Error()), ud.Message.Chat.ID, false)
+		return
+	}
+	fileIDs, err := parseFileSelection(tokens[1:])
+	if err != nil {
+		send(fmt.Sprintf("*%s:* %s", command, err.Error()), ud.Message.Chat.ID, false)
+		return
+	}
+	out, err := rpcCall("torrent_get", map[string]any{
+		"ids":    []int{torrentID},
+		"fields": []string{"id", "name", "files"},
+	})
+	if err != nil {
+		send(fmt.Sprintf("*%s:* %s", command, err.Error()), ud.Message.Chat.ID, false)
+		return
+	}
+	if len(out.Result.Torrents) == 0 {
+		send(fmt.Sprintf("*%s:* no torrent with id %d", command, torrentID), ud.Message.Chat.ID, false)
+		return
+	}
+	t := out.Result.Torrents[0]
+	if err := validateFileBounds(fileIDs, len(t.Files)); err != nil {
+		send(fmt.Sprintf("*%s:* %s", command, err.Error()), ud.Message.Chat.ID, false)
+		return
+	}
+
+	params := map[string]any{
+		"ids": []int{torrentID},
+	}
+	if wanted {
+		params["files_wanted"] = fileIDs
+	} else {
+		params["files_unwanted"] = fileIDs
+	}
+	if _, err := rpcCall("torrent_set", params); err != nil {
+		send(fmt.Sprintf("*%s:* %s", command, err.Error()), ud.Message.Chat.ID, false)
+		return
+	}
+	send(fmt.Sprintf("*%s:* updated %d file(s) in `%s`", command, len(fileIDs), mdReplacer.Replace(t.Name)), ud.Message.Chat.ID, true)
+}
+
+func fprio(ud tgbotapi.Update, tokens []string) {
+	if len(tokens) < 3 {
+		send("*fprio:* usage: fprio <id> <high|normal|low> <file...>", ud.Message.Chat.ID, false)
+		return
+	}
+	torrentID, err := parseIntToken(tokens[0])
+	if err != nil {
+		send("*fprio:* "+err.Error(), ud.Message.Chat.ID, false)
+		return
+	}
+	level := strings.ToLower(tokens[1])
+	targetField := ""
+	switch level {
+	case "high":
+		targetField = "priority_high"
+	case "normal":
+		targetField = "priority_normal"
+	case "low":
+		targetField = "priority_low"
+	default:
+		send("*fprio:* level must be high, normal, or low", ud.Message.Chat.ID, false)
+		return
+	}
+	fileIDs, err := parseFileSelection(tokens[2:])
+	if err != nil {
+		send("*fprio:* "+err.Error(), ud.Message.Chat.ID, false)
+		return
+	}
+	out, err := rpcCall("torrent_get", map[string]any{
+		"ids":    []int{torrentID},
+		"fields": []string{"id", "name", "files"},
+	})
+	if err != nil {
+		send("*fprio:* "+err.Error(), ud.Message.Chat.ID, false)
+		return
+	}
+	if len(out.Result.Torrents) == 0 {
+		send(fmt.Sprintf("*fprio:* no torrent with id %d", torrentID), ud.Message.Chat.ID, false)
+		return
+	}
+	t := out.Result.Torrents[0]
+	if err := validateFileBounds(fileIDs, len(t.Files)); err != nil {
+		send("*fprio:* "+err.Error(), ud.Message.Chat.ID, false)
+		return
+	}
+	if _, err := rpcCall("torrent_set", map[string]any{
+		"ids":       []int{torrentID},
+		targetField: fileIDs,
+	}); err != nil {
+		send("*fprio:* "+err.Error(), ud.Message.Chat.ID, false)
+		return
+	}
+	send(fmt.Sprintf("*fprio:* set %s priority for %d file(s) in `%s`", level, len(fileIDs), mdReplacer.Replace(t.Name)), ud.Message.Chat.ID, true)
 }
 
 // stop takes id[s] of torrent[s] or 'all' to stop them
