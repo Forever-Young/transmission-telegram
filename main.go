@@ -21,7 +21,7 @@ import (
 )
 
 const (
-	VERSION = "v1.4.1"
+	VERSION = "v1.5"
 
 	HELP = `
 	*list* or *li* or *ls*
